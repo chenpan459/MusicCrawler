@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.env
+qqmusic_cred.json
+*cred*.json
+downloads/
+*.mp3
+*.m4a
+*.flac
+.venv/
+venv/
