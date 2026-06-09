@@ -1,10 +1,17 @@
 # MusicCrawler
 
-基于 [QQ音乐](https://y.qq.com/) 的关键词搜索与歌曲下载工具。
+基于 [QQ音乐](https://y.qq.com/) 和 [酷我音乐](https://www.kuwo.cn/) 的关键词搜索与歌曲下载工具。
+
+## 支持平台
+
+| 平台 | 参数 | 网址 |
+|------|------|------|
+| QQ音乐 | `-p qq`（默认） | https://y.qq.com |
+| 酷我音乐 | `-p kuwo` | https://www.kuwo.cn |
 
 ## 功能
 
-- 关键词搜索歌曲（对接 y.qq.com 搜索接口）
+- 关键词搜索歌曲
 - 交互式或命令行指定下载
 - 支持多种音质：MP3 128k / MP3 320k / M4A / FLAC（失败时自动降级）
 - 批量下载全部搜索结果
@@ -33,7 +40,8 @@ python3 -m pip install -r requirements.txt
 只传 `-k` 时自动进入交换模式，支持：**搜索 → 按条目下载 → 回退重新搜索** 循环。
 
 ```bash
-./run.sh -k "稻香"
+./run.sh -p kuwo -k "稻香"
+./run.sh -p qq -k "稻香"
 ```
 
 操作流程：
@@ -55,6 +63,13 @@ python3 -m pip install -r requirements.txt
 
 ```bash
 python3 main.py -k "稻香" --no-exchange
+```
+
+### 酷我音乐下载
+
+```bash
+python3 main.py -p kuwo -k "稻香" -i 4
+python3 main.py -p kuwo -k "两只老虎" --all -o ./downloads
 ```
 
 ### 下载指定序号

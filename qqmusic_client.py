@@ -7,13 +7,13 @@ import base64
 import json
 import re
 import uuid
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
 import requests
 
 from credential import Credential, calc_g_tk
+from song import DownloadError, Song
 
 BASE_URL = "https://y.qq.com/"
 SEARCH_URL = "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg"
@@ -41,26 +41,6 @@ QUALITY_FALLBACK = ["mp3_128", "m4a", "mp3_320", "flac"]
 
 # result=0 表示可下载；104003 表示版权/VIP 限制（需会员登录）
 DOWNLOAD_BLOCKED_RESULTS = {104003}
-
-
-@dataclass
-class Song:
-    """搜索结果中的歌曲."""
-
-    id: str
-    mid: str
-    name: str
-    singer: str
-    downloadable: bool | None = None
-
-    def display(self, index: int) -> str:
-        if self.downloadable is True:
-            status = "[可下载]"
-        elif self.downloadable is False:
-            status = "[VIP/版权受限]"
-        else:
-            status = ""
-        return f"{index:>2}. {self.name} - {self.singer}  {status} [{self.mid}]"
 
 
 class QQMusicClient:
@@ -121,6 +101,7 @@ class QQMusicClient:
                     name=song.name,
                     singer=song.singer,
                     downloadable=downloadable,
+                    platform="qq",
                 )
             )
         return probed
@@ -245,6 +226,7 @@ class QQMusicClient:
                     mid=mid,
                     name=item.get("title", item.get("name", "")),
                     singer=singers or "未知歌手",
+                    platform="qq",
                 )
             )
         return songs[:limit]
@@ -258,6 +240,7 @@ class QQMusicClient:
             mid=item.get("mid", ""),
             name=item.get("name", ""),
             singer=singer or "未知歌手",
+            platform="qq",
         )
 
     def get_download_url(
@@ -431,7 +414,3 @@ class QQMusicClient:
     def _safe_filename(name: str) -> str:
         name = re.sub(r'[\\/:*?"<>|]', "_", name)
         return name.strip() or "unknown"
-
-
-class DownloadError(Exception):
-    """下载相关错误."""

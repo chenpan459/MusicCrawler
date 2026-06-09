@@ -1,27 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""QQ Music keyword search and download crawler."""
+"""Music keyword search and download crawler."""
 
 from __future__ import annotations
 
 import argparse
 import sys
+from typing import Protocol
 
 from credential import load_credential, save_credential_template
-from qqmusic_client import DownloadError, QQMusicClient, Song
+from kuwo_client import KuwoMusicClient
+from qqmusic_client import QQMusicClient
+from song import DownloadError, Song
+
+PLATFORM_NAMES = {
+    "qq": "QQ音乐 (y.qq.com)",
+    "kuwo": "酷我音乐 (kuwo.cn)",
+}
+
+
+class MusicClient(Protocol):
+    def search(self, keyword: str, limit: int = 20) -> list[Song]: ...
+    def probe_downloadable(self, songs: list[Song], quality: str = "mp3_128") -> list[Song]: ...
+    def download(
+        self,
+        song: Song,
+        output_dir: str,
+        quality: str = "mp3_128",
+        filename: str | None = None,
+        *,
+        with_lyric: bool = True,
+    ) -> tuple[str, str | None]: ...
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="QQ音乐 (y.qq.com) 关键词搜索与下载工具",
+        description="音乐关键词搜索与下载工具 (支持 QQ音乐 / 酷我音乐)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python main.py -k "稻香"
-  python main.py -k "两只老虎" -n 10
-  python main.py -k "晴天" -i 1 -q mp3_320
-  python main.py -k "海阔天空" --all -o ./music
+  python3 main.py -p kuwo -k "稻香"
+  python3 main.py -p qq -k "稻香" -i 1
+  python3 main.py -p kuwo -k "两只老虎" --all -o ./downloads
         """,
+    )
+    parser.add_argument(
+        "-p",
+        "--platform",
+        choices=["qq", "kuwo"],
+        default="qq",
+        help="音乐平台: qq (QQ音乐) 或 kuwo (酷我音乐)，默认 qq",
     )
     parser.add_argument("-k", "--keyword", help="搜索关键词")
     parser.add_argument("-n", "--num", type=int, default=10, help="搜索结果数量 (默认: 10)")
@@ -58,12 +86,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--credential",
         metavar="FILE",
-        help="QQ音乐登录凭证文件 (JSON 或浏览器 Cookie 文本)",
+        help="QQ音乐登录凭证文件 (仅 --platform qq 时有效)",
     )
     parser.add_argument(
         "--init-credential",
         metavar="FILE",
-        help="生成凭证文件模板",
+        help="生成 QQ音乐凭证文件模板",
     )
     parser.add_argument(
         "--no-probe",
@@ -83,8 +111,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def print_results(songs: list[Song], *, keyword: str = "") -> None:
-    title = f'关键词 "{keyword}" ' if keyword else ""
+def print_results(songs: list[Song], *, keyword: str = "", platform: str = "qq") -> None:
+    platform_name = PLATFORM_NAMES.get(platform, platform)
+    title = f'[{platform_name}] 关键词 "{keyword}" ' if keyword else f"[{platform_name}] "
     print(f"\n{title}找到 {len(songs)} 首歌曲:\n")
     for index, song in enumerate(songs, start=1):
         print(song.display(index))
@@ -103,7 +132,6 @@ def print_exchange_help() -> None:
 
 
 def parse_selection(choice: str, songs: list[Song]) -> list[Song] | None:
-    """解析用户输入的下载选择，无效输入返回 None。"""
     choice = choice.strip().lower()
     if not choice:
         return None
@@ -133,7 +161,7 @@ def choose_interactive(songs: list[Song]) -> list[Song]:
     return result or []
 
 
-def search_songs(client: QQMusicClient, keyword: str, args: argparse.Namespace) -> list[Song]:
+def search_songs(client: MusicClient, keyword: str, args: argparse.Namespace) -> list[Song]:
     print(f'正在搜索: "{keyword}" ...')
     songs = client.search(keyword, limit=args.num)
     if not songs:
@@ -150,7 +178,7 @@ def search_songs(client: QQMusicClient, keyword: str, args: argparse.Namespace) 
 
 
 def download_songs(
-    client: QQMusicClient,
+    client: MusicClient,
     songs: list[Song],
     output_dir: str,
     quality: str,
@@ -179,26 +207,30 @@ def download_songs(
     print(f"\n完成: 成功 {success}/{len(songs)} 首")
 
 
-def build_client(args: argparse.Namespace) -> QQMusicClient:
+def build_client(args: argparse.Namespace) -> MusicClient:
+    if args.platform == "kuwo":
+        if args.credential:
+            print("提示: --credential 仅适用于 QQ音乐，酷我音乐将忽略该参数")
+        return KuwoMusicClient()
+
     credential = None
     if args.credential:
         credential = load_credential(args.credential)
-        print("已加载登录凭证 (VIP 歌曲需账号有相应权限)")
+        print("已加载 QQ音乐登录凭证 (VIP 歌曲需账号有相应权限)")
     return QQMusicClient(credential=credential)
 
 
-def run_exchange_mode(client: QQMusicClient, args: argparse.Namespace) -> int:
-    """交换模式：搜索 -> 按条目下载 -> 可回退搜索。"""
-    print("=== QQ音乐交换模式 ===")
+def run_exchange_mode(client: MusicClient, args: argparse.Namespace) -> int:
+    platform_name = PLATFORM_NAMES.get(args.platform, args.platform)
+    print(f"=== {platform_name} 交换模式 ===")
     print("流程: [1] 搜索并显示结果  [2] 按序号下载  [3] 可回退重新搜索")
-    if not args.credential:
-        print("提示: 下载原版 VIP 歌曲需 --credential 登录绿钻账号")
+    if args.platform == "qq" and not args.credential:
+        print("提示: QQ音乐原版 VIP 歌曲需 --credential 登录绿钻账号")
     print()
 
     keyword = args.keyword or ""
 
     while True:
-        # 第一步：搜索
         print("--- [1] 搜索 ---")
         if keyword:
             prompt = f'请输入关键词 (直接回车继续搜索 "{keyword}"): '
@@ -225,9 +257,8 @@ def run_exchange_mode(client: QQMusicClient, args: argparse.Namespace) -> int:
             print("未找到相关歌曲，请换关键词重试。\n")
             continue
 
-        print_results(songs, keyword=keyword)
+        print_results(songs, keyword=keyword, platform=args.platform)
 
-        # 第二步 / 第三步：下载循环，可回退搜索
         while True:
             print("--- [2] 下载 ---")
             print_exchange_help()
@@ -240,7 +271,7 @@ def run_exchange_mode(client: QQMusicClient, args: argparse.Namespace) -> int:
                 print("\n回到搜索...\n")
                 break
             if choice in {"list", "l", "列表"}:
-                print_results(songs, keyword=keyword)
+                print_results(songs, keyword=keyword, platform=args.platform)
                 continue
 
             selected = parse_selection(choice, songs)
@@ -258,7 +289,7 @@ def run_exchange_mode(client: QQMusicClient, args: argparse.Namespace) -> int:
             print("可继续输入序号下载，或输入 search 回到搜索。\n")
 
 
-def run_once_mode(client: QQMusicClient, args: argparse.Namespace) -> int:
+def run_once_mode(client: MusicClient, args: argparse.Namespace) -> int:
     if not args.keyword:
         print("请提供搜索关键词: -k \"关键词\"", file=sys.stderr)
         return 1
@@ -273,7 +304,7 @@ def run_once_mode(client: QQMusicClient, args: argparse.Namespace) -> int:
         print("未找到相关歌曲，请尝试其他关键词。")
         return 1
 
-    print_results(songs, keyword=args.keyword)
+    print_results(songs, keyword=args.keyword, platform=args.platform)
 
     to_download: list[Song] = []
     if args.interactive:
@@ -290,7 +321,10 @@ def run_once_mode(client: QQMusicClient, args: argparse.Namespace) -> int:
         downloadable = [s for s in songs if s.downloadable]
         if downloadable:
             print("提示: 标有 [可下载] 的歌曲可直接下载，例如:")
-            print(f'  python3 main.py -k "{args.keyword}" -i {songs.index(downloadable[0]) + 1}')
+            print(
+                f'  python3 main.py -p {args.platform} -k "{args.keyword}" '
+                f"-i {songs.index(downloadable[0]) + 1}"
+            )
         print("使用 --exchange 进入交换模式，或 -i/--all/--interactive 直接下载")
         return 0
 
