@@ -9,6 +9,7 @@ import sys
 from typing import Protocol
 
 from credential import load_credential, save_credential_template
+from kugou_client import KugouMusicClient
 from kuwo_client import KuwoMusicClient
 from qqmusic_client import QQMusicClient
 from song import DownloadError, Song
@@ -16,6 +17,7 @@ from song import DownloadError, Song
 PLATFORM_NAMES = {
     "qq": "QQ音乐 (y.qq.com)",
     "kuwo": "酷我音乐 (kuwo.cn)",
+    "kugou": "酷狗音乐 (kugou.com)",
 }
 
 
@@ -35,21 +37,22 @@ class MusicClient(Protocol):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="音乐关键词搜索与下载工具 (支持 QQ音乐 / 酷我音乐)",
+        description="音乐关键词搜索与下载工具 (支持 QQ音乐 / 酷我音乐 / 酷狗音乐)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  python3 main.py -p kugou -k "稻香"
   python3 main.py -p kuwo -k "稻香"
   python3 main.py -p qq -k "稻香" -i 1
-  python3 main.py -p kuwo -k "两只老虎" --all -o ./downloads
+  python3 main.py -p kugou -k "两只老虎" --all -o ./downloads
         """,
     )
     parser.add_argument(
         "-p",
         "--platform",
-        choices=["qq", "kuwo"],
+        choices=["qq", "kuwo", "kugou"],
         default="qq",
-        help="音乐平台: qq (QQ音乐) 或 kuwo (酷我音乐)，默认 qq",
+        help="音乐平台: qq / kuwo / kugou，默认 qq",
     )
     parser.add_argument("-k", "--keyword", help="搜索关键词")
     parser.add_argument("-n", "--num", type=int, default=10, help="搜索结果数量 (默认: 10)")
@@ -212,6 +215,11 @@ def build_client(args: argparse.Namespace) -> MusicClient:
         if args.credential:
             print("提示: --credential 仅适用于 QQ音乐，酷我音乐将忽略该参数")
         return KuwoMusicClient()
+
+    if args.platform == "kugou":
+        if args.credential:
+            print("提示: --credential 仅适用于 QQ音乐，酷狗音乐将忽略该参数")
+        return KugouMusicClient()
 
     credential = None
     if args.credential:

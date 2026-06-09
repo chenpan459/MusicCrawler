@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -16,6 +17,7 @@ class Song:
     singer: str
     downloadable: bool | None = None
     platform: str = "qq"
+    meta: dict[str, Any] = field(default_factory=dict)
 
     def display(self, index: int) -> str:
         if self.downloadable is True:
