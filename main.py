@@ -8,9 +8,18 @@ import argparse
 import sys
 from typing import Protocol
 
-from credential import load_credential, save_credential_template
+from credential import load_credential, load_credential_if_exists, save_credential_template
 from kugou_client import KugouMusicClient
+from kugou_login import KugouCredential
+from kugou_login import LoginError as KugouLoginError
+from kugou_login import run_login as run_kugou_login
 from kuwo_client import KuwoMusicClient
+from kuwo_login import KuwoCredential
+from kuwo_login import LoginError as KuwoLoginError
+from kuwo_login import run_login as run_kuwo_login
+from platform_cred import default_credential_path, load_json_credential, resolve_credential_path
+from qq_login import LoginError as QQLoginError
+from qq_login import run_login as run_qq_login
 from qqmusic_client import QQMusicClient
 from song import DownloadError, Song
 
@@ -89,13 +98,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--credential",
         metavar="FILE",
-        help="QQ音乐登录凭证文件 (仅 --platform qq 时有效)",
+        help="登录凭证文件 (默认自动读取平台对应 cred 文件)",
     )
     parser.add_argument(
         "--init-credential",
         metavar="FILE",
         help="生成 QQ音乐凭证文件模板",
     )
+    parser.add_argument(
+        "--login",
+        choices=["qr", "phone", "password"],
+        help="登录: qr/phone(仅QQ), password=用户名+密码",
+    )
+    parser.add_argument("--user", help="登录用户名")
+    parser.add_argument("--password", help="登录密码")
     parser.add_argument(
         "--no-probe",
         action="store_true",
@@ -210,21 +226,79 @@ def download_songs(
     print(f"\n完成: 成功 {success}/{len(songs)} 首")
 
 
+def handle_login(args: argparse.Namespace) -> int:
+    cred_path = args.credential or str(default_credential_path(args.platform))
+    login_mode = args.login
+    if not login_mode:
+        if args.user or args.password:
+            login_mode = "password"
+        elif args.platform == "qq":
+            print("请指定登录方式: --login qr / phone / password", file=sys.stderr)
+            return 1
+        else:
+            login_mode = "password"
+
+    if args.platform == "qq" and login_mode not in {"qr", "phone", "password"}:
+        print("QQ音乐支持: --login qr / phone / password", file=sys.stderr)
+        return 1
+    if args.platform in {"kugou", "kuwo"} and login_mode != "password":
+        print(f"{PLATFORM_NAMES[args.platform]} 仅支持 --login password", file=sys.stderr)
+        return 1
+
+    try:
+        if args.platform == "qq":
+            run_qq_login(
+                login_mode,
+                username=args.user,
+                password=args.password,
+                path=cred_path,
+            )
+        elif args.platform == "kugou":
+            run_kugou_login(
+                login_mode,
+                username=args.user,
+                password=args.password,
+                path=cred_path,
+            )
+        else:
+            run_kuwo_login(
+                login_mode,
+                username=args.user,
+                password=args.password,
+                path=cred_path,
+            )
+        return 0
+    except (QQLoginError, KugouLoginError, KuwoLoginError) as exc:
+        print(f"登录失败: {exc}", file=sys.stderr)
+        return 1
+
+
 def build_client(args: argparse.Namespace) -> MusicClient:
+    cred_path = resolve_credential_path(args.platform, args.credential)
+
     if args.platform == "kuwo":
-        if args.credential:
-            print("提示: --credential 仅适用于 QQ音乐，酷我音乐将忽略该参数")
-        return KuwoMusicClient()
+        credential = None
+        if cred_path:
+            data = load_json_credential(cred_path)
+            if data:
+                credential = KuwoCredential.from_dict(data)
+                print(f"已加载酷我音乐登录凭证: {cred_path}")
+        return KuwoMusicClient(credential=credential)
 
     if args.platform == "kugou":
-        if args.credential:
-            print("提示: --credential 仅适用于 QQ音乐，酷狗音乐将忽略该参数")
-        return KugouMusicClient()
+        credential = None
+        if cred_path:
+            data = load_json_credential(cred_path)
+            if data:
+                credential = KugouCredential.from_dict(data)
+                print(f"已加载酷狗音乐登录凭证: {cred_path}")
+        return KugouMusicClient(credential=credential)
 
     credential = None
-    if args.credential:
-        credential = load_credential(args.credential)
-        print("已加载 QQ音乐登录凭证 (VIP 歌曲需账号有相应权限)")
+    if cred_path:
+        credential = load_credential_if_exists(cred_path)
+        if credential:
+            print(f"已加载 QQ音乐登录凭证: {cred_path}")
     return QQMusicClient(credential=credential)
 
 
@@ -232,8 +306,13 @@ def run_exchange_mode(client: MusicClient, args: argparse.Namespace) -> int:
     platform_name = PLATFORM_NAMES.get(args.platform, args.platform)
     print(f"=== {platform_name} 交换模式 ===")
     print("流程: [1] 搜索并显示结果  [2] 按序号下载  [3] 可回退重新搜索")
-    if args.platform == "qq" and not args.credential:
-        print("提示: QQ音乐原版 VIP 歌曲需 --credential 登录绿钻账号")
+    if not resolve_credential_path(args.platform, args.credential):
+        if args.platform == "qq":
+            print("提示: QQ音乐 VIP 歌曲需先登录: python3 main.py -p qq --login qr")
+        elif args.platform == "kugou":
+            print("提示: 酷狗 VIP 歌曲可先登录: python3 main.py -p kugou --login password --user 用户名 --password 密码")
+        elif args.platform == "kuwo":
+            print("提示: 酷我 VIP 歌曲可先登录: python3 main.py -p kuwo --login password --user 用户名 --password 密码")
     print()
 
     keyword = args.keyword or ""
@@ -366,8 +445,13 @@ def main() -> int:
     if args.init_credential:
         save_credential_template(args.init_credential)
         print(f"已生成凭证模板: {args.init_credential}")
-        print("请填入浏览器 Cookie 中的 uin 和 qqmusic_key 后，用 --credential 指定该文件")
+        print("也可使用登录命令自动获取凭证:")
+        print("  python3 main.py --login qr")
+        print("  python3 main.py --login phone --user 手机号")
         return 0
+
+    if args.login or args.user:
+        return handle_login(args)
 
     client = build_client(args)
 

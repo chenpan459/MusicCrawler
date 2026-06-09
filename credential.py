@@ -75,6 +75,33 @@ def calc_g_tk(musickey: str) -> int:
     return 2147483647 & h
 
 
+def save_credential(credential: Credential, path: str | Path) -> None:
+    """Save credential to JSON file."""
+    payload = {
+        "musicid": credential.musicid,
+        "musickey": credential.musickey,
+    }
+    Path(path).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def default_credential_path() -> Path:
+    return Path("qqmusic_cred.json")
+
+
+def load_credential_if_exists(path: str | Path | None = None) -> Credential | None:
+    """Load credential when file exists."""
+    target = Path(path) if path else default_credential_path()
+    if not target.exists():
+        return None
+    try:
+        return load_credential(target)
+    except (ValueError, json.JSONDecodeError, OSError):
+        return None
+
+
 def save_credential_template(path: str | Path) -> None:
     """Write an example credential template."""
     template = {

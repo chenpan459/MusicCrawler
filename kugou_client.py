@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 import requests
 
+from kugou_login import KugouCredential
 from song import DownloadError, Song
 
 BASE_URL = "https://www.kugou.com/"
@@ -49,10 +50,28 @@ QUALITY_FALLBACK = ["mp3_128", "mp3_320", "m4a", "flac"]
 class KugouMusicClient:
     """酷狗音乐爬虫客户端."""
 
-    def __init__(self, timeout: int = 30):
+    def __init__(self, timeout: int = 30, credential: KugouCredential | None = None):
         self.timeout = timeout
+        self.credential = credential
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
+        if credential:
+            self._apply_credential(credential)
+
+    def _apply_credential(self, credential: KugouCredential) -> None:
+        self.session.cookies.set("token", credential.token, domain=".kugou.com")
+        self.session.cookies.set("userid", credential.userid, domain=".kugou.com")
+        if credential.vip_token:
+            self.session.cookies.set("vip_token", credential.vip_token, domain=".kugou.com")
+        if credential.mid:
+            self.session.cookies.set("KUGOU_API_MID", credential.mid, domain=".kugou.com")
+        if credential.dfid:
+            self.session.cookies.set("dfid", credential.dfid, domain=".kugou.com")
+
+    def _auth_params(self) -> tuple[str, str]:
+        if self.credential:
+            return self.credential.token, self.credential.userid
+        return "", "0"
 
     def search(self, keyword: str, limit: int = 20) -> list[Song]:
         keyword = keyword.strip()
@@ -156,7 +175,13 @@ class KugouMusicClient:
 
     def _request_songinfo(self, song: Song) -> str | None:
         album_audio_id = str(song.meta.get("album_audio_id", song.id))
-        mid = hashlib.md5(str(time.time()).encode()).hexdigest()
+        token, userid = self._auth_params()
+        mid = (
+            self.credential.mid
+            if self.credential and self.credential.mid
+            else hashlib.md5(str(time.time()).encode()).hexdigest()
+        )
+        dfid = self.credential.dfid if self.credential else "-"
         clienttime = str(int(time.time() * 1000))
         signature = hashlib.md5(
             "".join(
@@ -165,13 +190,13 @@ class KugouMusicClient:
                     "appid=1014",
                     f"clienttime={clienttime}",
                     "clientver=20000",
-                    "dfid=-",
+                    f"dfid={dfid}",
                     f"encode_album_audio_id={album_audio_id}",
                     f"mid={mid}",
                     "platid=4",
                     "srcappid=2919",
-                    "token=",
-                    "userid=0",
+                    f"token={token}",
+                    f"userid={userid}",
                     f"uuid={mid}",
                     SIGN_SALT,
                 ]
@@ -183,12 +208,12 @@ class KugouMusicClient:
             "clienttime": clienttime,
             "mid": mid,
             "uuid": mid,
-            "dfid": "-",
+            "dfid": dfid,
             "appid": "1014",
             "platid": "4",
             "encode_album_audio_id": album_audio_id,
-            "token": "",
-            "userid": "0",
+            "token": token,
+            "userid": userid,
             "signature": signature,
         }
         response = self.session.get(

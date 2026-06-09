@@ -2,7 +2,11 @@ __pycache__/
 *.py[cod]
 .env
 qqmusic_cred.json
+kugou_cred.json
+kuwo_cred.json
 *cred*.json
+qq_login_qr.png
+kuwo_login_captcha.jpg
 downloads/
 *.mp3
 *.m4a

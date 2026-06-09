@@ -128,6 +128,68 @@ python3 main.py -k "稻香" -i 2 -o ./downloads
 | `-q, --quality` | 音质：mp3_128 / mp3_320 / m4a / flac |
 | `-o, --output` | 保存目录，默认 `./downloads` |
 
+## 平台登录（VIP 账号）
+
+各平台登录后凭证自动保存，后续下载时自动加载。
+
+| 平台 | 凭证文件 | 支持方式 |
+|------|----------|----------|
+| QQ音乐 | `qqmusic_cred.json` | 扫码 / 手机验证码 / 密码(手机号) |
+| 酷狗音乐 | `kugou_cred.json` | 用户名+密码 |
+| 酷我音乐 | `kuwo_cred.json` | 用户名+密码（需图形验证码） |
+
+### 酷狗音乐登录
+
+```bash
+python3 main.py -p kugou --login password --user 手机号 --password 你的密码
+python3 main.py -p kugou -k "稻香" -i 1
+```
+
+### 酷我音乐登录
+
+```bash
+python3 main.py -p kuwo --login password --user 手机号 --password 你的密码
+# 会生成 kuwo_login_captcha.jpg，输入图片中的验证码
+python3 main.py -p kuwo -k "稻香" -i 1
+```
+
+## QQ音乐登录（绿钻账号）
+
+支持三种登录方式，登录后凭证保存到 `qqmusic_cred.json`，后续自动加载。
+
+### 方式 1：QQ 扫码登录（推荐）
+
+```bash
+python3 main.py --login qr
+# 扫描生成的 qq_login_qr.png，用手机 QQ 确认
+```
+
+### 方式 2：手机号 + 验证码
+
+```bash
+# 交互式
+python3 main.py --login phone --user 13800138000
+
+# 一步完成（已收到验证码）
+python3 main.py --login phone --user 13800138000 --password 123456
+```
+
+### 方式 3：用户名 + 密码参数
+
+```bash
+# 手机号作为用户名，短信验证码作为密码
+python3 main.py --login password --user 13800138000 --password 123456
+```
+
+> QQ号+QQ密码暂不支持直接登录（腾讯需扫码/验证码）。请用扫码或手机号方式。
+
+### 登录后下载 VIP 歌曲
+
+```bash
+python3 main.py -p qq -k "稻香" -i 1
+# 自动读取 ./qqmusic_cred.json
+```
+
 ## 关于原版 VIP 歌曲 (104003)
 
 QQ 音乐**不存在可绕过的原版固定直链**。所有音频文件存放在 CDN 上，下载前必须向服务端申请带时效的 `vkey`，服务端会校验：
@@ -141,19 +203,17 @@ QQ 音乐**不存在可绕过的原版固定直链**。所有音频文件存放�
 **下载原版的唯一方式：使用已开通绿钻的 QQ 音乐账号登录。**
 
 ```bash
-# 1. 生成凭证模板
-python3 main.py --init-credential qqmusic_cred.json
+# 推荐：扫码登录
+python3 main.py --login qr
 
-# 2. 浏览器登录 y.qq.com，从 Cookie 复制 uin 和 qqmusic_key 填入文件
-
-# 3. 下载原版
-python3 main.py -k "稻香" -i 1 --credential qqmusic_cred.json
+# 然后下载
+python3 main.py -p qq -k "稻香" -i 1
 ```
 
-获取 Cookie：浏览器打开 [y.qq.com](https://y.qq.com) 并登录 -> F12 -> Application -> Cookies -> 复制 `uin` 和 `qqmusic_key`。
+也可手动导入浏览器 Cookie：见 `--init-credential` 说明。
 
 ## 注意事项
 
 - 本工具仅供技术学习研究，请尊重版权，支持正版音乐。
-- 登录凭证仅保存在本地，请勿泄露 `qqmusic_key`。
+- 登录凭证仅保存在本地，请勿泄露账号凭证文件。
 - 搜索接口返回数量受平台限制，建议使用更精确的关键词。

@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 import requests
 
+from kuwo_login import KuwoCredential, _calc_secret, _reqid_factory, find_iuvt_cookie
 from song import DownloadError, Song
 
 BASE_URL = "https://www.kuwo.cn/"
@@ -42,10 +43,31 @@ QUALITY_FALLBACK = ["mp3_128", "mp3_320", "m4a", "flac"]
 class KuwoMusicClient:
     """酷我音乐爬虫客户端."""
 
-    def __init__(self, timeout: int = 30):
+    def __init__(self, timeout: int = 30, credential: KuwoCredential | None = None):
         self.timeout = timeout
+        self.credential = credential
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
+        self._gen_reqid = _reqid_factory()
+        if credential:
+            self._apply_credential(credential)
+
+    def _apply_credential(self, credential: KuwoCredential) -> None:
+        for key, value in credential.cookies.items():
+            self.session.cookies.set(key, value, domain=".kuwo.cn")
+        cookie = find_iuvt_cookie(credential.cookies)
+        if cookie:
+            key, value = cookie
+            self.session.headers["Secret"] = _calc_secret(value, key)
+
+    def _ensure_secret(self) -> None:
+        if "Secret" in self.session.headers:
+            return
+        self.session.get(BASE_URL, timeout=self.timeout)
+        cookie = find_iuvt_cookie(self.session.cookies.get_dict())
+        if cookie:
+            key, value = cookie
+            self.session.headers["Secret"] = _calc_secret(value, key)
 
     def search(self, keyword: str, limit: int = 20) -> list[Song]:
         keyword = keyword.strip()
@@ -107,6 +129,25 @@ class KuwoMusicClient:
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
+    def _request_vip_play_url(self, music_id: str) -> str | None:
+        self._ensure_secret()
+        url = "https://www.kuwo.cn/api/v1/www/music/playUrl"
+        params = {
+            "mid": music_id,
+            "type": "music",
+            "httpsStatus": "1",
+            "reqId": self._gen_reqid(),
+            "plat": "web_www",
+            "from": "",
+        }
+        response = self.session.get(url, params=params, timeout=self.timeout)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code") != 200:
+            return None
+        play_url = payload.get("data", {}).get("url", "")
+        return play_url if play_url else None
+
     def get_download_url(
         self,
         music_id: str,
@@ -114,6 +155,11 @@ class KuwoMusicClient:
     ) -> tuple[str | None, str]:
         if quality not in QUALITY_MAP:
             raise ValueError(f"不支持的音质: {quality}，可选: {', '.join(QUALITY_MAP)}")
+
+        if self.credential:
+            vip_url = self._request_vip_play_url(music_id)
+            if vip_url:
+                return vip_url, self._guess_extension(quality, vip_url)
 
         fmt, br = QUALITY_MAP[quality]
         params = f"type=convert_url3&rid=MUSIC_{music_id}&format={fmt}&response=url"
