@@ -17,6 +17,10 @@ from kuwo_client import KuwoMusicClient
 from kuwo_login import KuwoCredential
 from kuwo_login import LoginError as KuwoLoginError
 from kuwo_login import run_login as run_kuwo_login
+from netease_client import NeteaseMusicClient
+from netease_login import NeteaseCredential
+from netease_login import LoginError as NeteaseLoginError
+from netease_login import run_login as run_netease_login
 from platform_cred import default_credential_path, load_json_credential, resolve_credential_path
 from qq_login import LoginError as QQLoginError
 from qq_login import run_login as run_qq_login
@@ -27,6 +31,7 @@ PLATFORM_NAMES = {
     "qq": "QQ音乐 (y.qq.com)",
     "kuwo": "酷我音乐 (kuwo.cn)",
     "kugou": "酷狗音乐 (kugou.com)",
+    "netease": "网易云音乐 (music.163.com)",
 }
 
 
@@ -46,10 +51,11 @@ class MusicClient(Protocol):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="音乐关键词搜索与下载工具 (支持 QQ音乐 / 酷我音乐 / 酷狗音乐)",
+        description="音乐关键词搜索与下载工具 (支持 QQ音乐 / 酷我 / 酷狗 / 网易云音乐)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  python3 main.py -p netease -k "稻香"
   python3 main.py -p kugou -k "稻香"
   python3 main.py -p kuwo -k "稻香"
   python3 main.py -p qq -k "稻香" -i 1
@@ -59,9 +65,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-p",
         "--platform",
-        choices=["qq", "kuwo", "kugou"],
+        choices=["qq", "kuwo", "kugou", "netease"],
         default="qq",
-        help="音乐平台: qq / kuwo / kugou，默认 qq",
+        help="音乐平台: qq / kuwo / kugou / netease，默认 qq",
     )
     parser.add_argument("-k", "--keyword", help="搜索关键词")
     parser.add_argument("-n", "--num", type=int, default=10, help="搜索结果数量 (默认: 10)")
@@ -108,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--login",
         choices=["qr", "phone", "password"],
-        help="登录: qr/phone(仅QQ), password=用户名+密码",
+        help="登录: qr/phone/password (QQ/网易云均支持)",
     )
     parser.add_argument("--user", help="登录用户名")
     parser.add_argument("--password", help="登录密码")
@@ -241,6 +247,9 @@ def handle_login(args: argparse.Namespace) -> int:
     if args.platform == "qq" and login_mode not in {"qr", "phone", "password"}:
         print("QQ音乐支持: --login qr / phone / password", file=sys.stderr)
         return 1
+    if args.platform == "netease" and login_mode not in {"qr", "phone", "password"}:
+        print("网易云音乐支持: --login qr / phone / password", file=sys.stderr)
+        return 1
     if args.platform in {"kugou", "kuwo"} and login_mode != "password":
         print(f"{PLATFORM_NAMES[args.platform]} 仅支持 --login password", file=sys.stderr)
         return 1
@@ -260,15 +269,22 @@ def handle_login(args: argparse.Namespace) -> int:
                 password=args.password,
                 path=cred_path,
             )
-        else:
+        elif args.platform == "kuwo":
             run_kuwo_login(
                 login_mode,
                 username=args.user,
                 password=args.password,
                 path=cred_path,
             )
+        else:
+            run_netease_login(
+                login_mode,
+                username=args.user,
+                password=args.password,
+                path=cred_path,
+            )
         return 0
-    except (QQLoginError, KugouLoginError, KuwoLoginError) as exc:
+    except (QQLoginError, KugouLoginError, KuwoLoginError, NeteaseLoginError) as exc:
         print(f"登录失败: {exc}", file=sys.stderr)
         return 1
 
@@ -294,6 +310,15 @@ def build_client(args: argparse.Namespace) -> MusicClient:
                 print(f"已加载酷狗音乐登录凭证: {cred_path}")
         return KugouMusicClient(credential=credential)
 
+    if args.platform == "netease":
+        credential = None
+        if cred_path:
+            data = load_json_credential(cred_path)
+            if data:
+                credential = NeteaseCredential.from_dict(data)
+                print(f"已加载网易云音乐登录凭证: {cred_path}")
+        return NeteaseMusicClient(credential=credential)
+
     credential = None
     if cred_path:
         credential = load_credential_if_exists(cred_path)
@@ -313,6 +338,8 @@ def run_exchange_mode(client: MusicClient, args: argparse.Namespace) -> int:
             print("提示: 酷狗 VIP 歌曲可先登录: python3 main.py -p kugou --login password --user 用户名 --password 密码")
         elif args.platform == "kuwo":
             print("提示: 酷我 VIP 歌曲可先登录: python3 main.py -p kuwo --login password --user 用户名 --password 密码")
+        elif args.platform == "netease":
+            print("提示: 网易云 VIP 歌曲可先登录: python3 main.py -p netease --login qr")
     print()
 
     keyword = args.keyword or ""

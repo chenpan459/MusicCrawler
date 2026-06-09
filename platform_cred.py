@@ -11,6 +11,7 @@ CREDENTIAL_FILES = {
     "qq": "qqmusic_cred.json",
     "kugou": "kugou_cred.json",
     "kuwo": "kuwo_cred.json",
+    "netease": "netease_cred.json",
 }
 
 

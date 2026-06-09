@@ -4,9 +4,11 @@ __pycache__/
 qqmusic_cred.json
 kugou_cred.json
 kuwo_cred.json
+netease_cred.json
 *cred*.json
 qq_login_qr.png
 kuwo_login_captcha.jpg
+netease_login_qr.png
 downloads/
 *.mp3
 *.m4a

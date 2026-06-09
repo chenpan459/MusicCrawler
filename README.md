@@ -1,6 +1,6 @@
 # MusicCrawler
 
-基于 [QQ音乐](https://y.qq.com/)、[酷我音乐](https://www.kuwo.cn/) 和 [酷狗音乐](https://www.kugou.com/) 的关键词搜索与歌曲下载工具。
+基于 [QQ音乐](https://y.qq.com/)、[酷我音乐](https://www.kuwo.cn/)、[酷狗音乐](https://www.kugou.com/) 和 [网易云音乐](https://music.163.com/) 的关键词搜索与歌曲下载工具。
 
 ## 支持平台
 
@@ -9,6 +9,7 @@
 | QQ音乐 | `-p qq`（默认） | https://y.qq.com |
 | 酷我音乐 | `-p kuwo` | https://www.kuwo.cn |
 | 酷狗音乐 | `-p kugou` | https://www.kugou.com |
+| 网易云音乐 | `-p netease` | https://music.163.com |
 
 ## 功能
 
@@ -41,6 +42,7 @@ python3 -m pip install -r requirements.txt
 只传 `-k` 时自动进入交换模式，支持：**搜索 → 按条目下载 → 回退重新搜索** 循环。
 
 ```bash
+./run.sh -p netease -k "稻香"
 ./run.sh -p kugou -k "稻香"
 ./run.sh -p kuwo -k "稻香"
 ./run.sh -p qq -k "稻香"
@@ -137,6 +139,23 @@ python3 main.py -k "稻香" -i 2 -o ./downloads
 | QQ音乐 | `qqmusic_cred.json` | 扫码 / 手机验证码 / 密码(手机号) |
 | 酷狗音乐 | `kugou_cred.json` | 用户名+密码 |
 | 酷我音乐 | `kuwo_cred.json` | 用户名+密码（需图形验证码） |
+| 网易云音乐 | `netease_cred.json` | 扫码 / 手机验证码 / 用户名+密码 |
+
+### 网易云音乐登录
+
+```bash
+# 扫码登录（推荐）
+python3 main.py -p netease --login qr
+
+# 手机号+密码
+python3 main.py -p netease --login password --user 13800138000 --password 你的密码
+
+# 手机验证码登录
+python3 main.py -p netease --login phone --user 13800138000 --password 123456
+
+# 登录后下载
+python3 main.py -p netease -k "稻香" -i 1
+```
 
 ### 酷狗音乐登录
 
