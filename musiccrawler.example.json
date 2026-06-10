@@ -1,0 +1,17 @@
+{
+  "platform": "netease",
+  "num": 10,
+  "quality": "mp3_128",
+  "output": "./downloads",
+  "proxy": null,
+  "retries": 3,
+  "timeout": 30,
+  "rate_limit": 2.0,
+  "workers": 3,
+  "verbose": false,
+  "json_log": false,
+  "no_probe": false,
+  "only_downloadable": false,
+  "no_lyric": false,
+  "no_verify_credential": false
+}

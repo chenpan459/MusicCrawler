@@ -5,54 +5,45 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
-from typing import Protocol
 
-from credential import load_credential, load_credential_if_exists, save_credential_template
-from kugou_client import KugouMusicClient
-from kugou_login import KugouCredential
+from app_config import config_defaults
+from app_logging import setup_logging
+from base_client import MusicClient
+from credential import save_credential_template
+from download_manager import download_songs
+from http_client import ClientConfig
 from kugou_login import LoginError as KugouLoginError
 from kugou_login import run_login as run_kugou_login
-from kuwo_client import KuwoMusicClient
-from kuwo_login import KuwoCredential
 from kuwo_login import LoginError as KuwoLoginError
 from kuwo_login import run_login as run_kuwo_login
-from netease_client import NeteaseMusicClient
-from netease_login import NeteaseCredential
 from netease_login import LoginError as NeteaseLoginError
 from netease_login import run_login as run_netease_login
-from platform_cred import default_credential_path, load_json_credential, resolve_credential_path
+from platform_cred import default_credential_path, resolve_credential_path
+from platforms import PLATFORM_NAMES, build_client
 from qq_login import LoginError as QQLoginError
 from qq_login import run_login as run_qq_login
-from qqmusic_client import QQMusicClient
-from song import DownloadError, Song
+from song import Song
 
-PLATFORM_NAMES = {
-    "qq": "QQ音乐 (y.qq.com)",
-    "kuwo": "酷我音乐 (kuwo.cn)",
-    "kugou": "酷狗音乐 (kugou.com)",
-    "netease": "网易云音乐 (music.163.com)",
-}
-
-
-class MusicClient(Protocol):
-    def search(self, keyword: str, limit: int = 20) -> list[Song]: ...
-    def probe_downloadable(self, songs: list[Song], quality: str = "mp3_128") -> list[Song]: ...
-    def download(
-        self,
-        song: Song,
-        output_dir: str,
-        quality: str = "mp3_128",
-        filename: str | None = None,
-        *,
-        with_lyric: bool = True,
-    ) -> tuple[str, str | None]: ...
+logger = logging.getLogger("musiccrawler")
 
 
 def parse_args() -> argparse.Namespace:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
+        "-c",
+        "--config",
+        metavar="FILE",
+        help="配置文件路径 (默认读取 ./musiccrawler.json)",
+    )
+    pre_args, argv = pre_parser.parse_known_args()
+    cfg = config_defaults(pre_args.config)
+
     parser = argparse.ArgumentParser(
         description="音乐关键词搜索与下载工具 (支持 QQ音乐 / 酷我 / 酷狗 / 网易云音乐)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[pre_parser],
         epilog="""
 示例:
   python3 main.py -p netease -k "稻香"
@@ -60,57 +51,38 @@ def parse_args() -> argparse.Namespace:
   python3 main.py -p kuwo -k "稻香"
   python3 main.py -p qq -k "稻香" -i 1
   python3 main.py -p kugou -k "两只老虎" --all -o ./downloads
+  python3 main.py -c musiccrawler.json -k "稻香" --workers 3
         """,
     )
     parser.add_argument(
         "-p",
         "--platform",
         choices=["qq", "kuwo", "kugou", "netease"],
-        default="qq",
+        default=cfg["platform"],
         help="音乐平台: qq / kuwo / kugou / netease，默认 qq",
     )
     parser.add_argument("-k", "--keyword", help="搜索关键词")
-    parser.add_argument("-n", "--num", type=int, default=10, help="搜索结果数量 (默认: 10)")
+    parser.add_argument("-n", "--num", type=int, default=cfg["num"], help="搜索结果数量 (默认: 10)")
     parser.add_argument("-i", "--index", type=int, help="下载指定序号的歌曲 (从 1 开始)")
     parser.add_argument("--all", action="store_true", help="下载全部搜索结果")
     parser.add_argument(
         "-q",
         "--quality",
-        default="mp3_128",
+        default=cfg["quality"],
         choices=["mp3_128", "mp3_320", "m4a", "flac"],
         help="音质 (默认: mp3_128，失败时自动降级)",
     )
     parser.add_argument(
         "-o",
         "--output",
-        default="./downloads",
+        default=cfg["output"],
         help="下载保存目录 (默认: ./downloads)",
     )
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="交互模式：搜索后手动选择要下载的歌曲（单次）",
-    )
-    parser.add_argument(
-        "--exchange",
-        action="store_true",
-        help="交换模式：搜索 -> 按条目下载 -> 可回退重新搜索（循环，仅 -k 时默认开启）",
-    )
-    parser.add_argument(
-        "--no-exchange",
-        action="store_true",
-        help="关闭交换模式，仅执行单次搜索",
-    )
-    parser.add_argument(
-        "--credential",
-        metavar="FILE",
-        help="登录凭证文件 (默认自动读取平台对应 cred 文件)",
-    )
-    parser.add_argument(
-        "--init-credential",
-        metavar="FILE",
-        help="生成 QQ音乐凭证文件模板",
-    )
+    parser.add_argument("--interactive", action="store_true", help="交互模式：搜索后手动选择要下载的歌曲（单次）")
+    parser.add_argument("--exchange", action="store_true", help="交换模式：搜索 -> 按条目下载 -> 可回退重新搜索")
+    parser.add_argument("--no-exchange", action="store_true", help="关闭交换模式，仅执行单次搜索")
+    parser.add_argument("--credential", metavar="FILE", help="登录凭证文件 (默认自动读取平台对应 cred 文件)")
+    parser.add_argument("--init-credential", metavar="FILE", help="生成 QQ音乐凭证文件模板")
     parser.add_argument(
         "--login",
         choices=["qr", "phone", "password"],
@@ -118,22 +90,40 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--user", help="登录用户名")
     parser.add_argument("--password", help="登录密码")
-    parser.add_argument(
-        "--no-probe",
-        action="store_true",
-        help="跳过可下载状态检测",
-    )
+    parser.add_argument("--no-probe", action="store_true", default=cfg["no_probe"], help="跳过可下载状态检测")
     parser.add_argument(
         "--only-downloadable",
         action="store_true",
-        help="仅显示/下载当前账号权限下可获取链接的歌曲",
+        default=cfg["only_downloadable"],
+        help="仅显示/下载可获取链接的歌曲",
+    )
+    parser.add_argument("--no-lyric", action="store_true", default=cfg["no_lyric"], help="下载时不保存歌词 (.lrc)")
+    parser.add_argument("--proxy", metavar="URL", default=cfg["proxy"], help="HTTP/HTTPS 代理，如 http://127.0.0.1:7890")
+    parser.add_argument("--retries", type=int, default=cfg["retries"], help="HTTP 请求重试次数 (默认: 3)")
+    parser.add_argument("--timeout", type=int, default=cfg["timeout"], help="HTTP 超时秒数 (默认: 30)")
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=cfg["rate_limit"],
+        metavar="RPS",
+        help="HTTP 限速 (请求/秒，0 表示不限速)",
     )
     parser.add_argument(
-        "--no-lyric",
-        action="store_true",
-        help="下载时不保存歌词 (.lrc)",
+        "-j",
+        "--workers",
+        type=int,
+        default=cfg["workers"],
+        help="并发下载线程数 (默认: 1)",
     )
-    return parser.parse_args()
+    parser.add_argument("--verbose", action="store_true", default=cfg["verbose"], help="输出调试日志")
+    parser.add_argument("--json-log", action="store_true", default=cfg["json_log"], help="以 JSON 格式输出日志")
+    parser.add_argument(
+        "--no-verify-credential",
+        action="store_true",
+        default=cfg["no_verify_credential"],
+        help="跳过凭证有效性检查",
+    )
+    return parser.parse_args(argv)
 
 
 def print_results(songs: list[Song], *, keyword: str = "", platform: str = "qq") -> None:
@@ -187,6 +177,7 @@ def choose_interactive(songs: list[Song]) -> list[Song]:
 
 
 def search_songs(client: MusicClient, keyword: str, args: argparse.Namespace) -> list[Song]:
+    logger.info("search keyword=%s platform=%s", keyword, args.platform)
     print(f'正在搜索: "{keyword}" ...')
     songs = client.search(keyword, limit=args.num)
     if not songs:
@@ -200,36 +191,6 @@ def search_songs(client: MusicClient, keyword: str, args: argparse.Namespace) ->
         songs = [s for s in songs if s.downloadable]
 
     return songs
-
-
-def download_songs(
-    client: MusicClient,
-    songs: list[Song],
-    output_dir: str,
-    quality: str,
-    *,
-    with_lyric: bool = True,
-) -> None:
-    success = 0
-    for song in songs:
-        print(f"正在下载: {song.name} - {song.singer} ...")
-        try:
-            audio_path, lyric_path = client.download(
-                song, output_dir, quality=quality, with_lyric=with_lyric
-            )
-            print(f"  ✓ 音频: {audio_path}")
-            if with_lyric:
-                if lyric_path:
-                    print(f"  ✓ 歌词: {lyric_path}")
-                else:
-                    print("  - 歌词: 暂无")
-            success += 1
-        except DownloadError as exc:
-            print(f"  ✗ 失败: {exc}")
-        except Exception as exc:
-            print(f"  ✗ 失败: {exc}")
-
-    print(f"\n完成: 成功 {success}/{len(songs)} 首")
 
 
 def handle_login(args: argparse.Namespace) -> int:
@@ -256,75 +217,40 @@ def handle_login(args: argparse.Namespace) -> int:
 
     try:
         if args.platform == "qq":
-            run_qq_login(
-                login_mode,
-                username=args.user,
-                password=args.password,
-                path=cred_path,
-            )
+            run_qq_login(login_mode, username=args.user, password=args.password, path=cred_path)
         elif args.platform == "kugou":
-            run_kugou_login(
-                login_mode,
-                username=args.user,
-                password=args.password,
-                path=cred_path,
-            )
+            run_kugou_login(login_mode, username=args.user, password=args.password, path=cred_path)
         elif args.platform == "kuwo":
-            run_kuwo_login(
-                login_mode,
-                username=args.user,
-                password=args.password,
-                path=cred_path,
-            )
+            run_kuwo_login(login_mode, username=args.user, password=args.password, path=cred_path)
         else:
-            run_netease_login(
-                login_mode,
-                username=args.user,
-                password=args.password,
-                path=cred_path,
-            )
+            run_netease_login(login_mode, username=args.user, password=args.password, path=cred_path)
         return 0
     except (QQLoginError, KugouLoginError, KuwoLoginError, NeteaseLoginError) as exc:
         print(f"登录失败: {exc}", file=sys.stderr)
         return 1
 
 
-def build_client(args: argparse.Namespace) -> MusicClient:
+def make_client_config(args: argparse.Namespace) -> ClientConfig:
+    return ClientConfig(
+        timeout=args.timeout,
+        proxy=args.proxy,
+        retries=args.retries,
+        rate_limit=max(0.0, args.rate_limit),
+    )
+
+
+def create_client(args: argparse.Namespace) -> MusicClient:
     cred_path = resolve_credential_path(args.platform, args.credential)
-
-    if args.platform == "kuwo":
-        credential = None
-        if cred_path:
-            data = load_json_credential(cred_path)
-            if data:
-                credential = KuwoCredential.from_dict(data)
-                print(f"已加载酷我音乐登录凭证: {cred_path}")
-        return KuwoMusicClient(credential=credential)
-
-    if args.platform == "kugou":
-        credential = None
-        if cred_path:
-            data = load_json_credential(cred_path)
-            if data:
-                credential = KugouCredential.from_dict(data)
-                print(f"已加载酷狗音乐登录凭证: {cred_path}")
-        return KugouMusicClient(credential=credential)
-
-    if args.platform == "netease":
-        credential = None
-        if cred_path:
-            data = load_json_credential(cred_path)
-            if data:
-                credential = NeteaseCredential.from_dict(data)
-                print(f"已加载网易云音乐登录凭证: {cred_path}")
-        return NeteaseMusicClient(credential=credential)
-
-    credential = None
+    config = make_client_config(args)
+    client = build_client(
+        args.platform,
+        config=config,
+        cred_path=cred_path,
+        verify=not args.no_verify_credential,
+    )
     if cred_path:
-        credential = load_credential_if_exists(cred_path)
-        if credential:
-            print(f"已加载 QQ音乐登录凭证: {cred_path}")
-    return QQMusicClient(credential=credential)
+        print(f"已加载 {PLATFORM_NAMES[args.platform]} 登录凭证: {cred_path}")
+    return client
 
 
 def run_exchange_mode(client: MusicClient, args: argparse.Namespace) -> int:
@@ -332,31 +258,30 @@ def run_exchange_mode(client: MusicClient, args: argparse.Namespace) -> int:
     print(f"=== {platform_name} 交换模式 ===")
     print("流程: [1] 搜索并显示结果  [2] 按序号下载  [3] 可回退重新搜索")
     if not resolve_credential_path(args.platform, args.credential):
-        if args.platform == "qq":
-            print("提示: QQ音乐 VIP 歌曲需先登录: python3 main.py -p qq --login qr")
-        elif args.platform == "kugou":
-            print("提示: 酷狗 VIP 歌曲可先登录: python3 main.py -p kugou --login password --user 用户名 --password 密码")
-        elif args.platform == "kuwo":
-            print("提示: 酷我 VIP 歌曲可先登录: python3 main.py -p kuwo --login password --user 用户名 --password 密码")
-        elif args.platform == "netease":
-            print("提示: 网易云 VIP 歌曲可先登录: python3 main.py -p netease --login qr")
+        hints = {
+            "qq": "python3 main.py -p qq --login qr",
+            "kugou": "python3 main.py -p kugou --login password --user 用户名 --password 密码",
+            "kuwo": "python3 main.py -p kuwo --login password --user 用户名 --password 密码",
+            "netease": "python3 main.py -p netease --login qr",
+        }
+        if args.platform in hints:
+            print(f"提示: VIP 歌曲可先登录: {hints[args.platform]}")
     print()
 
     keyword = args.keyword or ""
-
     while True:
         print("--- [1] 搜索 ---")
-        if keyword:
-            prompt = f'请输入关键词 (直接回车继续搜索 "{keyword}"): '
-        else:
-            prompt = "请输入关键词: "
+        prompt = (
+            f'请输入关键词 (直接回车继续搜索 "{keyword}"): '
+            if keyword
+            else "请输入关键词: "
+        )
         user_kw = input(prompt).strip()
         if user_kw.lower() in {"quit", "q", "exit", "退出"}:
             print("已退出。")
             return 0
         if user_kw:
             keyword = user_kw
-
         if not keyword:
             print("关键词不能为空。")
             continue
@@ -364,6 +289,7 @@ def run_exchange_mode(client: MusicClient, args: argparse.Namespace) -> int:
         try:
             songs = search_songs(client, keyword, args)
         except Exception as exc:
+            logger.exception("search failed")
             print(f"搜索失败: {exc}", file=sys.stderr)
             continue
 
@@ -398,6 +324,7 @@ def run_exchange_mode(client: MusicClient, args: argparse.Namespace) -> int:
                 selected,
                 args.output,
                 args.quality,
+                workers=args.workers,
                 with_lyric=not args.no_lyric,
             )
             print("可继续输入序号下载，或输入 search 回到搜索。\n")
@@ -411,6 +338,7 @@ def run_once_mode(client: MusicClient, args: argparse.Namespace) -> int:
     try:
         songs = search_songs(client, args.keyword, args)
     except Exception as exc:
+        logger.exception("search failed")
         print(f"搜索失败: {exc}", file=sys.stderr)
         return 1
 
@@ -451,6 +379,7 @@ def run_once_mode(client: MusicClient, args: argparse.Namespace) -> int:
         to_download,
         args.output,
         args.quality,
+        workers=args.workers,
         with_lyric=not args.no_lyric,
     )
     return 0
@@ -468,6 +397,7 @@ def should_use_exchange_mode(args: argparse.Namespace) -> bool:
 
 def main() -> int:
     args = parse_args()
+    setup_logging(verbose=args.verbose, json_log=args.json_log)
 
     if args.init_credential:
         save_credential_template(args.init_credential)
@@ -480,7 +410,7 @@ def main() -> int:
     if args.login or args.user:
         return handle_login(args)
 
-    client = build_client(args)
+    client = create_client(args)
 
     if should_use_exchange_mode(args):
         return run_exchange_mode(client, args)

@@ -11,8 +11,9 @@ import time
 from typing import Any
 from urllib.parse import quote
 
-import requests
-
+from base_client import BaseMusicClient
+from crypto.kugou_sign import signature_web
+from http_client import ClientConfig, HttpSession
 from kugou_login import KugouCredential
 from song import DownloadError, Song
 
@@ -25,7 +26,6 @@ TRACKER_URLS = [
 ]
 LYRIC_SEARCH_URL = "https://lyrics.kugou.com/search"
 LYRIC_DOWNLOAD_URL = "https://lyrics.kugou.com/download"
-SIGN_SALT = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt"
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -47,26 +47,33 @@ QUALITY_HASH_KEYS = {
 QUALITY_FALLBACK = ["mp3_128", "mp3_320", "m4a", "flac"]
 
 
-class KugouMusicClient:
+class KugouMusicClient(BaseMusicClient):
     """酷狗音乐爬虫客户端."""
 
-    def __init__(self, timeout: int = 30, credential: KugouCredential | None = None):
-        self.timeout = timeout
+    platform = "kugou"
+
+    def __init__(
+        self,
+        timeout: int = 30,
+        credential: KugouCredential | None = None,
+        *,
+        config: ClientConfig | None = None,
+    ):
         self.credential = credential
-        self.session = requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
+        self.config = config or ClientConfig(timeout=timeout)
+        self.http = HttpSession(headers=DEFAULT_HEADERS, config=self.config)
         if credential:
             self._apply_credential(credential)
 
     def _apply_credential(self, credential: KugouCredential) -> None:
-        self.session.cookies.set("token", credential.token, domain=".kugou.com")
-        self.session.cookies.set("userid", credential.userid, domain=".kugou.com")
+        self.http.session.cookies.set("token", credential.token, domain=".kugou.com")
+        self.http.session.cookies.set("userid", credential.userid, domain=".kugou.com")
         if credential.vip_token:
-            self.session.cookies.set("vip_token", credential.vip_token, domain=".kugou.com")
+            self.http.session.cookies.set("vip_token", credential.vip_token, domain=".kugou.com")
         if credential.mid:
-            self.session.cookies.set("KUGOU_API_MID", credential.mid, domain=".kugou.com")
+            self.http.session.cookies.set("KUGOU_API_MID", credential.mid, domain=".kugou.com")
         if credential.dfid:
-            self.session.cookies.set("dfid", credential.dfid, domain=".kugou.com")
+            self.http.session.cookies.set("dfid", credential.dfid, domain=".kugou.com")
 
     def _auth_params(self) -> tuple[str, str]:
         if self.credential:
@@ -83,7 +90,7 @@ class KugouMusicClient:
             f"{SEARCH_URL}?format=json&keyword={quote(keyword)}"
             f"&page=1&pagesize={page_size}&showtype=1"
         )
-        response = self.session.get(url, timeout=self.timeout)
+        response = self.http.get(url)
         response.raise_for_status()
         payload = response.json()
         if payload.get("status") != 1:
@@ -94,29 +101,60 @@ class KugouMusicClient:
             songs.append(self._parse_song(item))
         return songs[:limit]
 
+    @staticmethod
+    def _guess_from_pay_meta(meta: dict, *, has_login: bool) -> bool | None:
+        pay_type = int(meta.get("pay_type", -1))
+        privilege = int(meta.get("privilege", -1))
+        if pay_type in {1, 3} and not has_login:
+            return False
+        if privilege in {8, 10} and not has_login:
+            return False
+        if pay_type == 0 and privilege == 0:
+            return None
+        return None
+
+    def _batch_probe_tracker(self, hashes: list[str]) -> dict[str, bool]:
+        mapping: dict[str, bool] = {}
+        for file_hash in dict.fromkeys(h for h in hashes if h):
+            mapping[file_hash] = self._request_tracker(file_hash) is not None
+        return mapping
+
+    def _probe_single_quality(self, song: Song, quality: str) -> bool:
+        file_hash = self._pick_hash(song, quality)
+        if not file_hash:
+            return False
+        if self._request_tracker(file_hash):
+            return True
+        if self.credential:
+            return self._request_songinfo(song) is not None
+        return False
+
     def probe_downloadable(self, songs: list[Song], quality: str = "mp3_128") -> list[Song]:
+        has_login = self.credential is not None
         probed: list[Song] = []
+        need_api: list[Song] = []
+
         for song in songs:
-            downloadable = self.is_downloadable(song, quality=quality)
-            probed.append(
-                Song(
-                    id=song.id,
-                    mid=song.mid,
-                    name=song.name,
-                    singer=song.singer,
-                    downloadable=downloadable,
-                    platform="kugou",
-                    meta=dict(song.meta),
-                )
-            )
+            guess = self._guess_from_pay_meta(song.meta, has_login=has_login)
+            if guess is not None:
+                probed.append(self.copy_song(song, guess))
+            else:
+                need_api.append(song)
+
+        if need_api:
+            hashes = [self._pick_hash(song, quality) for song in need_api]
+            batch = self._batch_probe_tracker(hashes)
+            for song in need_api:
+                file_hash = self._pick_hash(song, quality)
+                downloadable = batch.get(file_hash)
+                if downloadable is None:
+                    downloadable = self._probe_single_quality(song, quality)
+                probed.append(self.copy_song(song, downloadable))
+
         return probed
 
     def is_downloadable(self, song: Song, quality: str = "mp3_128") -> bool:
-        try:
-            self.resolve_download_url(song, quality=quality)
-            return True
-        except DownloadError:
-            return False
+        return self._probe_single_quality(song, quality)
 
     def _parse_song(self, item: dict[str, Any]) -> Song:
         file_hash = str(item.get("hash", "")).lower()
@@ -136,6 +174,8 @@ class KugouMusicClient:
                 "album_audio_id": album_audio_id,
                 "album_id": str(item.get("album_id", "")),
                 "duration": int(item.get("duration", 0) or 0),
+                "pay_type": int(item.get("pay_type", item.get("album_pay_type", -1)) or -1),
+                "privilege": int(item.get("privilege", -1) or -1),
             },
         )
 
@@ -161,7 +201,7 @@ class KugouMusicClient:
         key = self._tracker_key(file_hash)
         for base in TRACKER_URLS:
             url = f"{base}&hash={file_hash}&key={key}"
-            response = self.session.get(url, timeout=self.timeout)
+            response = self.http.get(url)
             response.raise_for_status()
             payload = response.json()
             if payload.get("status") != 1:
@@ -183,25 +223,21 @@ class KugouMusicClient:
         )
         dfid = self.credential.dfid if self.credential else "-"
         clienttime = str(int(time.time() * 1000))
-        signature = hashlib.md5(
-            "".join(
-                [
-                    SIGN_SALT,
-                    "appid=1014",
-                    f"clienttime={clienttime}",
-                    "clientver=20000",
-                    f"dfid={dfid}",
-                    f"encode_album_audio_id={album_audio_id}",
-                    f"mid={mid}",
-                    "platid=4",
-                    "srcappid=2919",
-                    f"token={token}",
-                    f"userid={userid}",
-                    f"uuid={mid}",
-                    SIGN_SALT,
-                ]
-            ).encode()
-        ).hexdigest()
+        signature = signature_web(
+            {
+                "appid": "1014",
+                "clienttime": clienttime,
+                "clientver": "20000",
+                "dfid": dfid,
+                "encode_album_audio_id": album_audio_id,
+                "mid": mid,
+                "platid": "4",
+                "srcappid": "2919",
+                "token": token,
+                "userid": userid,
+                "uuid": mid,
+            }
+        )
         params = {
             "srcappid": "2919",
             "clientver": "20000",
@@ -216,11 +252,7 @@ class KugouMusicClient:
             "userid": userid,
             "signature": signature,
         }
-        response = self.session.get(
-            "https://wwwapi.kugou.com/play/songinfo",
-            params=params,
-            timeout=self.timeout,
-        )
+        response = self.http.get("https://wwwapi.kugou.com/play/songinfo", params=params)
         response.raise_for_status()
         payload = response.json()
         if payload.get("status") != 1:
@@ -229,7 +261,7 @@ class KugouMusicClient:
         return play_url if play_url else None
 
     def resolve_download_url(self, song: Song, quality: str = "mp3_128") -> tuple[str, str]:
-        qualities = [quality] + [q for q in QUALITY_FALLBACK if q != quality]
+        qualities = self.quality_chain(quality, QUALITY_FALLBACK)
         for q in qualities:
             file_hash = self._pick_hash(song, q)
             if not file_hash:
@@ -250,7 +282,7 @@ class KugouMusicClient:
             f"{LYRIC_SEARCH_URL}?ver=1&man=yes&client=pc&keyword="
             f"&duration={duration}&hash={file_hash}&album_audio_id={album_audio_id}"
         )
-        response = self.session.get(search_url, timeout=self.timeout)
+        response = self.http.get(search_url)
         response.raise_for_status()
         payload = response.json()
         candidates = payload.get("candidates", [])
@@ -267,7 +299,7 @@ class KugouMusicClient:
             f"{LYRIC_DOWNLOAD_URL}?ver=1&client=pc&id={lyric_id}"
             f"&accesskey={accesskey}&fmt=lrc&charset=utf8"
         )
-        lyric_response = self.session.get(download_url, timeout=self.timeout)
+        lyric_response = self.http.get(download_url)
         lyric_response.raise_for_status()
         lyric_payload = lyric_response.json()
         content = lyric_payload.get("content", "")
@@ -300,34 +332,15 @@ class KugouMusicClient:
         *,
         with_lyric: bool = True,
     ) -> tuple[str, str | None]:
-        import os
-
-        url, ext = self.resolve_download_url(song, quality)
-        safe_name = filename or self._safe_filename(f"{song.name} - {song.singer}")
-        os.makedirs(output_dir, exist_ok=True)
-        filepath = os.path.join(output_dir, f"{safe_name}.{ext}")
-
-        response = self.session.get(url, timeout=self.timeout, stream=True)
-        response.raise_for_status()
-        with open(filepath, "wb") as file:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    file.write(chunk)
-
-        if os.path.getsize(filepath) < 1024:
-            os.remove(filepath)
-            raise DownloadError("下载文件过小，可能下载失败")
-
-        lyric_path = self.save_lyric(song, output_dir, safe_name) if with_lyric else None
-        return filepath, lyric_path
-
-    @staticmethod
-    def _default_ext(quality: str) -> str:
-        if quality == "flac":
-            return "flac"
-        if quality == "m4a":
-            return "m4a"
-        return "mp3"
+        return self.download_song_file(
+            song,
+            output_dir,
+            quality,
+            resolve_url=self.resolve_download_url,
+            save_lyric=self.save_lyric,
+            filename=filename,
+            with_lyric=with_lyric,
+        )
 
     @staticmethod
     def _guess_extension(quality: str, url: str) -> str:
@@ -336,9 +349,4 @@ class KugouMusicClient:
             return "flac"
         if ".m4a" in lowered or ".aac" in lowered:
             return "m4a"
-        return KugouMusicClient._default_ext(quality)
-
-    @staticmethod
-    def _safe_filename(name: str) -> str:
-        name = re.sub(r'[\\/:*?"<>|]', "_", name)
-        return name.strip() or "unknown"
+        return BaseMusicClient.default_ext(quality)

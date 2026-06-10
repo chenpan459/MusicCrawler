@@ -3,16 +3,17 @@
 
 from __future__ import annotations
 
-import ast
 import html
 import json
 import re
 from typing import Any
 from urllib.parse import quote
 
-import requests
-
-from kuwo_login import KuwoCredential, _calc_secret, _reqid_factory, find_iuvt_cookie
+from base_client import BaseMusicClient
+from crypto.kuwo_secret import calc_secret, find_iuvt_cookie, reqid_factory
+from http_client import ClientConfig, HttpSession
+from kuwo_login import KuwoCredential
+from kuwo_parse import parse_kuwo_search_payload
 from song import DownloadError, Song
 
 BASE_URL = "https://www.kuwo.cn/"
@@ -21,11 +22,6 @@ DOWNLOAD_URL = "https://antiserver.kuwo.cn/anti.s"
 LYRIC_URL = "https://www.kuwo.cn/openapi/v1/www/lyric/getlyric"
 
 DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
     "Referer": BASE_URL,
     "Accept": "*/*",
 }
@@ -40,34 +36,41 @@ QUALITY_MAP = {
 QUALITY_FALLBACK = ["mp3_128", "mp3_320", "m4a", "flac"]
 
 
-class KuwoMusicClient:
+class KuwoMusicClient(BaseMusicClient):
     """酷我音乐爬虫客户端."""
 
-    def __init__(self, timeout: int = 30, credential: KuwoCredential | None = None):
-        self.timeout = timeout
+    platform = "kuwo"
+
+    def __init__(
+        self,
+        timeout: int = 30,
+        credential: KuwoCredential | None = None,
+        *,
+        config: ClientConfig | None = None,
+    ):
         self.credential = credential
-        self.session = requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
-        self._gen_reqid = _reqid_factory()
+        self.config = config or ClientConfig(timeout=timeout)
+        self.http = HttpSession(headers=DEFAULT_HEADERS, config=self.config)
+        self._gen_reqid = reqid_factory()
         if credential:
             self._apply_credential(credential)
 
     def _apply_credential(self, credential: KuwoCredential) -> None:
         for key, value in credential.cookies.items():
-            self.session.cookies.set(key, value, domain=".kuwo.cn")
+            self.http.session.cookies.set(key, value, domain=".kuwo.cn")
         cookie = find_iuvt_cookie(credential.cookies)
         if cookie:
             key, value = cookie
-            self.session.headers["Secret"] = _calc_secret(value, key)
+            self.http.session.headers["Secret"] = calc_secret(value, key)
 
     def _ensure_secret(self) -> None:
-        if "Secret" in self.session.headers:
+        if "Secret" in self.http.session.headers:
             return
-        self.session.get(BASE_URL, timeout=self.timeout)
-        cookie = find_iuvt_cookie(self.session.cookies.get_dict())
+        self.http.get(BASE_URL)
+        cookie = find_iuvt_cookie(self.http.session.cookies.get_dict())
         if cookie:
             key, value = cookie
-            self.session.headers["Secret"] = _calc_secret(value, key)
+            self.http.session.headers["Secret"] = calc_secret(value, key)
 
     def search(self, keyword: str, limit: int = 20) -> list[Song]:
         keyword = keyword.strip()
@@ -79,47 +82,77 @@ class KuwoMusicClient:
             f"{SEARCH_URL}?all={quote(keyword)}&ft=music&itemset=web_2013"
             f"&client=kt&pn=0&rn={page_size}&rformat=json&encoding=utf8"
         )
-        response = self.session.get(url, timeout=self.timeout)
-        response.raise_for_status()
-        payload = ast.literal_eval(response.text)
+        response = self.http.get(url)
+        payload = parse_kuwo_search_payload(response.text)
         songs: list[Song] = []
         for item in payload.get("abslist", []):
             songs.append(self._parse_song(item))
         return songs[:limit]
 
+    @staticmethod
+    def _guess_from_pay_meta(meta: dict, *, has_login: bool) -> bool | None:
+        tpay = int(meta.get("tpay", -1))
+        fee_song = int(meta.get("fee_song", -1))
+        if tpay == 0 or fee_song == 0:
+            return False
+        if (tpay == 1 or fee_song == 1) and not has_login:
+            return True
+        if not has_login and tpay in {2, 3}:
+            return False
+        return None
+
+    def _batch_probe_download(self, music_ids: list[str], quality: str) -> dict[str, bool]:
+        mapping: dict[str, bool] = {}
+        for music_id in dict.fromkeys(mid for mid in music_ids if mid):
+            mapping[music_id] = self._probe_single_quality(music_id, quality)
+        return mapping
+
+    def _probe_single_quality(self, music_id: str, quality: str) -> bool:
+        try:
+            url, _ = self.get_download_url(music_id, quality)
+            return bool(url)
+        except ValueError:
+            return False
+
     def probe_downloadable(self, songs: list[Song], quality: str = "mp3_128") -> list[Song]:
+        has_login = self.credential is not None
         probed: list[Song] = []
+        need_api: list[Song] = []
+
         for song in songs:
-            downloadable = self.is_downloadable(song.mid, quality=quality)
-            probed.append(
-                Song(
-                    id=song.id,
-                    mid=song.mid,
-                    name=song.name,
-                    singer=song.singer,
-                    downloadable=downloadable,
-                    platform="kuwo",
-                )
-            )
+            guess = self._guess_from_pay_meta(song.meta, has_login=has_login)
+            if guess is not None:
+                probed.append(self.copy_song(song, guess))
+            else:
+                need_api.append(song)
+
+        if need_api:
+            batch = self._batch_probe_download([song.mid for song in need_api], quality)
+            for song in need_api:
+                downloadable = batch.get(song.mid, False)
+                probed.append(self.copy_song(song, downloadable))
+
         return probed
 
     def is_downloadable(self, music_id: str, quality: str = "mp3_128") -> bool:
-        try:
-            self.resolve_download_url(music_id, quality=quality)
-            return True
-        except DownloadError:
-            return False
+        return self._probe_single_quality(music_id, quality)
 
     def _parse_song(self, item: dict[str, Any]) -> Song:
         music_id = str(item.get("DC_TARGETID") or item.get("MUSICRID", "").replace("MUSIC_", ""))
         name = self._clean_text(item.get("SONGNAME", ""))
         singer = self._clean_text(item.get("ARTIST", ""))
+        pay_info = item.get("payInfo") or {}
+        fee_type = pay_info.get("feeType") or {}
         return Song(
             id=music_id,
             mid=music_id,
             name=name or "未知歌曲",
             singer=singer or "未知歌手",
             platform="kuwo",
+            meta={
+                "tpay": int(item.get("tpay", -1) or -1),
+                "fee_song": int(fee_type.get("song", -1) or -1),
+            },
         )
 
     @staticmethod
@@ -140,8 +173,7 @@ class KuwoMusicClient:
             "plat": "web_www",
             "from": "",
         }
-        response = self.session.get(url, params=params, timeout=self.timeout)
-        response.raise_for_status()
+        response = self.http.get(url, params=params)
         payload = response.json()
         if payload.get("code") != 200:
             return None
@@ -166,8 +198,7 @@ class KuwoMusicClient:
         if br:
             params += f"&br={br}"
         url = f"{DOWNLOAD_URL}?{params}"
-        response = self.session.get(url, timeout=self.timeout)
-        response.raise_for_status()
+        response = self.http.get(url)
 
         text = response.text.strip()
         if text.startswith("{"):
@@ -175,8 +206,7 @@ class KuwoMusicClient:
                 payload = json.loads(text)
                 download_url = payload.get("url", "")
                 if download_url:
-                    ext = self._guess_extension(quality, download_url)
-                    return download_url, ext
+                    return download_url, self._guess_extension(quality, download_url)
             except json.JSONDecodeError:
                 pass
         if text.startswith("http"):
@@ -184,7 +214,7 @@ class KuwoMusicClient:
         return None, self._default_ext(quality)
 
     def resolve_download_url(self, music_id: str, quality: str = "mp3_128") -> tuple[str, str]:
-        qualities = [quality] + [q for q in QUALITY_FALLBACK if q != quality]
+        qualities = self.quality_chain(quality, QUALITY_FALLBACK)
         for q in qualities:
             url, ext = self.get_download_url(music_id, q)
             if url:
@@ -193,8 +223,7 @@ class KuwoMusicClient:
 
     def get_lyric(self, music_id: str) -> str | None:
         url = f"{LYRIC_URL}?musicId={music_id}"
-        response = self.session.get(url, timeout=self.timeout)
-        response.raise_for_status()
+        response = self.http.get(url)
         payload = response.json()
         lrclist = payload.get("data", {}).get("lrclist", [])
         if not lrclist:
@@ -229,6 +258,9 @@ class KuwoMusicClient:
             file.write(lyric)
         return lyric_path
 
+    def _resolve_song_url(self, song: Song, quality: str) -> tuple[str, str]:
+        return self.resolve_download_url(song.mid, quality)
+
     def download(
         self,
         song: Song,
@@ -238,34 +270,15 @@ class KuwoMusicClient:
         *,
         with_lyric: bool = True,
     ) -> tuple[str, str | None]:
-        import os
-
-        url, ext = self.resolve_download_url(song.mid, quality)
-        safe_name = filename or self._safe_filename(f"{song.name} - {song.singer}")
-        os.makedirs(output_dir, exist_ok=True)
-        filepath = os.path.join(output_dir, f"{safe_name}.{ext}")
-
-        response = self.session.get(url, timeout=self.timeout, stream=True)
-        response.raise_for_status()
-        with open(filepath, "wb") as file:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    file.write(chunk)
-
-        if os.path.getsize(filepath) < 1024:
-            os.remove(filepath)
-            raise DownloadError("下载文件过小，可能下载失败")
-
-        lyric_path = self.save_lyric(song, output_dir, safe_name) if with_lyric else None
-        return filepath, lyric_path
-
-    @staticmethod
-    def _default_ext(quality: str) -> str:
-        if quality == "m4a":
-            return "m4a"
-        if quality == "flac":
-            return "flac"
-        return "mp3"
+        return self.download_song_file(
+            song,
+            output_dir,
+            quality,
+            resolve_url=self._resolve_song_url,
+            save_lyric=self.save_lyric,
+            filename=filename,
+            with_lyric=with_lyric,
+        )
 
     @staticmethod
     def _guess_extension(quality: str, url: str) -> str:
@@ -274,9 +287,4 @@ class KuwoMusicClient:
             return "flac"
         if ".m4a" in lowered or ".aac" in lowered:
             return "m4a"
-        return KuwoMusicClient._default_ext(quality)
-
-    @staticmethod
-    def _safe_filename(name: str) -> str:
-        name = re.sub(r'[\\/:*?"<>|]', "_", name)
-        return name.strip() or "unknown"
+        return BaseMusicClient.default_ext(quality)

@@ -10,9 +10,9 @@ import uuid
 from typing import Any
 from urllib.parse import quote
 
-import requests
-
+from base_client import BaseMusicClient
 from credential import Credential, calc_g_tk
+from http_client import ClientConfig, HttpSession
 from song import DownloadError, Song
 
 BASE_URL = "https://y.qq.com/"
@@ -43,24 +43,31 @@ QUALITY_FALLBACK = ["mp3_128", "m4a", "mp3_320", "flac"]
 DOWNLOAD_BLOCKED_RESULTS = {104003}
 
 
-class QQMusicClient:
+class QQMusicClient(BaseMusicClient):
     """QQ音乐爬虫客户端."""
 
-    def __init__(self, timeout: int = 30, credential: Credential | None = None):
-        self.timeout = timeout
+    platform = "qq"
+
+    def __init__(
+        self,
+        timeout: int = 30,
+        credential: Credential | None = None,
+        *,
+        config: ClientConfig | None = None,
+    ):
         self.credential = credential
-        self.session = requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
+        self.config = config or ClientConfig(timeout=timeout)
+        self.http = HttpSession(headers=DEFAULT_HEADERS, config=self.config)
         self._guid = str(uuid.uuid4().int)[:10]
         if credential:
             self._apply_credential(credential)
 
     def _apply_credential(self, credential: Credential) -> None:
         uin = credential.uin_str
-        self.session.cookies.set("uin", uin, domain=".qq.com")
-        self.session.cookies.set("qqmusic_uin", uin, domain=".qq.com")
-        self.session.cookies.set("qqmusic_key", credential.musickey, domain=".qq.com")
-        self.session.cookies.set("qm_keyst", credential.musickey, domain=".qq.com")
+        self.http.session.cookies.set("uin", uin, domain=".qq.com")
+        self.http.session.cookies.set("qqmusic_uin", uin, domain=".qq.com")
+        self.http.session.cookies.set("qqmusic_key", credential.musickey, domain=".qq.com")
+        self.http.session.cookies.set("qm_keyst", credential.musickey, domain=".qq.com")
 
     def _uin_value(self) -> str | int:
         if self.credential:
@@ -90,21 +97,53 @@ class QQMusicClient:
         return songs[:limit]
 
     def probe_downloadable(self, songs: list[Song], quality: str = "mp3_128") -> list[Song]:
-        """检测每首歌是否可下载，并写回 Song.downloadable 字段。"""
+        """检测每首歌是否可下载，批量请求减少 API 调用。"""
+        if not songs:
+            return []
+        batch = self._batch_probe_vkey([song.mid for song in songs], quality)
         probed: list[Song] = []
         for song in songs:
-            downloadable = self.is_downloadable(song.mid, quality=quality)
-            probed.append(
-                Song(
-                    id=song.id,
-                    mid=song.mid,
-                    name=song.name,
-                    singer=song.singer,
-                    downloadable=downloadable,
-                    platform="qq",
-                )
-            )
+            downloadable = batch.get(song.mid)
+            if downloadable is None:
+                downloadable = self.is_downloadable(song.mid, quality=quality)
+            probed.append(self.copy_song(song, downloadable))
         return probed
+
+    def _batch_probe_vkey(self, song_mids: list[str], quality: str) -> dict[str, bool]:
+        if not song_mids or quality not in QUALITY_MAP:
+            return {}
+        prefix, ext = QUALITY_MAP[quality]
+        filenames = [f"{prefix}{mid}{mid}.{ext}" for mid in song_mids]
+        uin = self._uin_value()
+        param: dict[str, Any] = {
+            "guid": self._guid,
+            "songmid": song_mids,
+            "songtype": [0] * len(song_mids),
+            "uin": str(uin),
+            "filename": filenames,
+            "ctx": 0,
+        }
+        if self.credential:
+            param["loginflag"] = 1
+        data = {
+            "comm": self._build_comm(),
+            "req_0": {
+                "module": "music.vkey.GetVkey",
+                "method": "UrlGetVkey",
+                "param": param,
+            },
+        }
+        url = f"{VKEY_URL}?format=json&data={quote(json.dumps(data, separators=(',', ':')))}"
+        try:
+            response = self.http.get(url)
+            payload = response.json()
+        except Exception:
+            return {}
+        mapping: dict[str, bool] = {}
+        for item in payload.get("req_0", {}).get("data", {}).get("midurlinfo", []):
+            mid = item.get("songmid", "")
+            mapping[mid] = bool(item.get("purl")) and item.get("result", -1) not in DOWNLOAD_BLOCKED_RESULTS
+        return mapping
 
     def is_downloadable(self, song_mid: str, quality: str = "mp3_128") -> bool:
         """快速检测歌曲当前是否可获取下载链接。"""
@@ -149,7 +188,7 @@ class QQMusicClient:
             },
         }
         url = f"{VKEY_URL}?format=json&data={quote(json.dumps(data, separators=(',', ':')))}"
-        response = self.session.get(url, timeout=self.timeout)
+        response = self.http.get(url)
         response.raise_for_status()
         tracks = response.json().get("req", {}).get("data", {}).get("tracks", [])
         if not tracks:
@@ -161,7 +200,7 @@ class QQMusicClient:
 
     def _search_smartbox(self, keyword: str) -> list[dict[str, Any]]:
         url = f"{SEARCH_URL}?format=json&key={quote(keyword)}"
-        response = self.session.get(url, timeout=self.timeout)
+        response = self.http.get(url)
         response.raise_for_status()
         payload = response.json()
         if payload.get("code") != 0:
@@ -208,7 +247,7 @@ class QQMusicClient:
                 "Chrome/100.0.4896.127 Mobile Safari/537.36"
             ),
         }
-        response = self.session.get(url, headers=mobile_headers, timeout=self.timeout)
+        response = self.http.get(url, headers=mobile_headers)
         response.raise_for_status()
         payload = response.json()
 
@@ -280,7 +319,7 @@ class QQMusicClient:
             },
         }
         url = f"{VKEY_URL}?format=json&data={quote(json.dumps(data, separators=(',', ':')))}"
-        response = self.session.get(url, timeout=self.timeout)
+        response = self.http.get(url)
         response.raise_for_status()
         payload = response.json()
 
@@ -301,7 +340,7 @@ class QQMusicClient:
         quality: str = "mp3_128",
     ) -> tuple[str, str]:
         """按音质优先级解析可下载链接，返回 (url, extension)。"""
-        qualities = [quality] + [q for q in QUALITY_FALLBACK if q != quality]
+        qualities = self.quality_chain(quality, QUALITY_FALLBACK)
         last_code = -1
         for q in qualities:
             url, code, ext = self.get_download_url(song_mid, q)
@@ -325,7 +364,7 @@ class QQMusicClient:
             f"{LYRIC_URL}?songmid={quote(song_mid)}"
             "&format=json&nobase64=1&g_tk=5381"
         )
-        response = self.session.get(url, timeout=self.timeout)
+        response = self.http.get(url)
         response.raise_for_status()
         payload = response.json()
         if payload.get("retcode") == 0 or payload.get("code") == 0:
@@ -351,7 +390,7 @@ class QQMusicClient:
         fallback_url = (
             f"{VKEY_URL}?format=json&data={quote(json.dumps(data, separators=(',', ':')))}"
         )
-        response = self.session.get(fallback_url, timeout=self.timeout)
+        response = self.http.get(fallback_url)
         response.raise_for_status()
         lyric = response.json().get("req", {}).get("data", {}).get("lyric", "")
         if not lyric:
@@ -378,6 +417,9 @@ class QQMusicClient:
             file.write(lyric)
         return lyric_path
 
+    def _resolve_song_url(self, song: Song, quality: str) -> tuple[str, str]:
+        return self.resolve_download_url(song.mid, quality)
+
     def download(
         self,
         song: Song,
@@ -386,31 +428,14 @@ class QQMusicClient:
         filename: str | None = None,
         *,
         with_lyric: bool = True,
-    ) -> str:
-        """下载歌曲到指定目录，返回保存路径。"""
-        import os
-
-        url, ext = self.resolve_download_url(song.mid, quality)
-        safe_name = filename or self._safe_filename(f"{song.name} - {song.singer}")
-        os.makedirs(output_dir, exist_ok=True)
-        filepath = os.path.join(output_dir, f"{safe_name}.{ext}")
-
-        response = self.session.get(url, timeout=self.timeout, stream=True)
-        response.raise_for_status()
-
-        with open(filepath, "wb") as file:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    file.write(chunk)
-
-        if os.path.getsize(filepath) < 1024:
-            os.remove(filepath)
-            raise DownloadError("下载文件过小，可能下载失败")
-
-        lyric_path = self.save_lyric(song, output_dir, safe_name) if with_lyric else None
-        return filepath, lyric_path
-
-    @staticmethod
-    def _safe_filename(name: str) -> str:
-        name = re.sub(r'[\\/:*?"<>|]', "_", name)
-        return name.strip() or "unknown"
+    ) -> tuple[str, str | None]:
+        """下载歌曲到指定目录，返回 (音频路径, 歌词路径)。"""
+        return self.download_song_file(
+            song,
+            output_dir,
+            quality,
+            resolve_url=self._resolve_song_url,
+            save_lyric=self.save_lyric,
+            filename=filename,
+            with_lyric=with_lyric,
+        )

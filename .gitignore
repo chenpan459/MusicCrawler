@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .env
+musiccrawler.json
 qqmusic_cred.json
 kugou_cred.json
 kuwo_cred.json

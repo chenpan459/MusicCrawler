@@ -129,6 +129,15 @@ python3 main.py -k "稻香" -i 2 -o ./downloads
 | `--interactive` | 交互选择要下载的歌曲 |
 | `-q, --quality` | 音质：mp3_128 / mp3_320 / m4a / flac |
 | `-o, --output` | 保存目录，默认 `./downloads` |
+| `-c, --config` | 配置文件 (默认读取 `./musiccrawler.json`) |
+| `--proxy` | HTTP/HTTPS 代理 |
+| `--retries` | 请求重试次数，默认 3 |
+| `--timeout` | 请求超时秒数，默认 30 |
+| `--rate-limit` | HTTP 限速 (请求/秒，0=不限) |
+| `-j, --workers` | 并发下载线程数，默认 1 |
+| `--verbose` | 调试日志 |
+| `--json-log` | JSON 格式日志 |
+| `--no-verify-credential` | 跳过凭证有效性检查 |
 
 ## 平台登录（VIP 账号）
 
@@ -231,8 +240,49 @@ python3 main.py -p qq -k "稻香" -i 1
 
 也可手动导入浏览器 Cookie：见 `--init-credential` 说明。
 
+### 配置文件
+
+复制示例并按需修改：
+
+```bash
+cp musiccrawler.example.json musiccrawler.json
+python3 main.py -k "稻香"
+```
+
+也可通过环境变量 `MUSICCRAWLER_CONFIG` 或 `-c /path/to/config.json` 指定配置。命令行参数优先于配置文件。
+
+常用配置项：`platform`、`proxy`、`rate_limit`、`workers`、`output`、`quality`。
+
+### 并发下载与限速
+
+```bash
+# 3 线程并发下载，HTTP 限速 2 请求/秒
+python3 main.py -p netease -k "稻香" --all --workers 3 --rate-limit 2
+```
+
+## 工程化改进
+
+| 模块 | 说明 |
+|------|------|
+| `http_client.py` | 统一 HTTP 会话，支持代理、超时、重试、线程安全、限速 |
+| `download_manager.py` | 并发下载编排 |
+| `app_config.py` | JSON 配置文件加载 |
+| `crypto/` | 各平台签名/加密逻辑集中管理 |
+| `platforms.py` | 平台注册表与客户端工厂 |
+| `credential_verify.py` | 启动时检查凭证是否仍有效 |
+| `platform_cred.py` | 凭证保存时自动 `chmod 600` |
+| `kuwo_parse.py` | 安全解析酷我搜索响应（替代 `ast.literal_eval`） |
+
+QQ / 网易云 probe 已改为批量查询；酷狗 / 酷我采用搜索元数据启发式 + 去重批量探测，probe 仅检测目标音质（不再逐级降级）。
+
+### 运行测试
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/ -v
+```
+
 ## 注意事项
 
 - 本工具仅供技术学习研究，请尊重版权，支持正版音乐。
-- 登录凭证仅保存在本地，请勿泄露账号凭证文件。
+- 登录凭证仅保存在本地（`chmod 600`），请勿泄露账号凭证文件。
 - 搜索接口返回数量受平台限制，建议使用更精确的关键词。

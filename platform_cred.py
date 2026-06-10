@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -41,3 +42,7 @@ def load_json_credential(path: str | Path) -> dict[str, Any] | None:
 def save_json_credential(data: dict[str, Any], path: str | Path) -> None:
     output = Path(path)
     output.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(output, 0o600)
+    except OSError:
+        pass

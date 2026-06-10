@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,10 +82,15 @@ def save_credential(credential: Credential, path: str | Path) -> None:
         "musicid": credential.musicid,
         "musickey": credential.musickey,
     }
-    Path(path).write_text(
+    output = Path(path)
+    output.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    try:
+        os.chmod(output, 0o600)
+    except OSError:
+        pass
 
 
 def default_credential_path() -> Path:

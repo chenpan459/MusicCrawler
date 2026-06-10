@@ -17,11 +17,11 @@ import requests
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
+from crypto.kugou_sign import signature_android
 from platform_cred import default_credential_path, save_json_credential
 
 APPID = 1005
 CLIENTVER = 20489
-SIGNATURE_ANDROID_SECRET = "OIlwieks28dk2k092lksi2UIkp"
 PUBLIC_RSA_KEY = """-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDIAG7QOELSYoIJvTFJhMpe1s/g
 bjDJX51HBNnEl5HXqTW6lQ7LC8jr9fWZTwusknp+sVGzwd40MwP6U5yDE27M/X1+UR
@@ -143,17 +143,6 @@ def _rsa_encrypt(payload: dict[str, Any]) -> str:
     return encrypted.hex().upper()
 
 
-def _signature_android(params: dict[str, Any], data: str = "") -> str:
-    parts = []
-    for key in sorted(params):
-        value = params[key]
-        if isinstance(value, (dict, list)):
-            value = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
-        parts.append(f"{key}={value}")
-    params_string = "".join(parts)
-    return _md5_hex(f"{SIGNATURE_ANDROID_SECRET}{params_string}{data}{SIGNATURE_ANDROID_SECRET}")
-
-
 def _init_device_cookies() -> dict[str, str]:
     guid = str(uuid.uuid4())
     mid = _calculate_mid(guid)
@@ -198,7 +187,7 @@ def _send_gateway_request(
     data_str = ""
     if data is not None:
         data_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-    params["signature"] = _signature_android(params, data_str)
+    params["signature"] = signature_android(params, data_str)
 
     headers = {
         **DEFAULT_HEADERS,

@@ -3,23 +3,19 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
-import requests
-
-from netease_crypto import encrypt_weapi
+from base_client import BaseMusicClient
+from crypto.netease_weapi import encrypt_weapi
+from http_client import ClientConfig, HttpSession
 from netease_login import NeteaseCredential
 from song import DownloadError, Song
 
 BASE_URL = "https://music.163.com/"
 
 DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
     "Referer": BASE_URL,
     "Origin": "https://music.163.com",
 }
@@ -33,15 +29,25 @@ QUALITY_PROFILES = {
 
 QUALITY_FALLBACK = ["mp3_128", "mp3_320", "m4a", "flac"]
 
+# fee: 0/8 通常可免费获取；1 为 VIP；4 为数字专辑
+FREE_FEE_VALUES = {0, 8}
 
-class NeteaseMusicClient:
+
+class NeteaseMusicClient(BaseMusicClient):
     """网易云音乐爬虫客户端."""
 
-    def __init__(self, timeout: int = 30, credential: NeteaseCredential | None = None):
-        self.timeout = timeout
+    platform = "netease"
+
+    def __init__(
+        self,
+        timeout: int = 30,
+        credential: NeteaseCredential | None = None,
+        *,
+        config: ClientConfig | None = None,
+    ):
         self.credential = credential
-        self.session = requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
+        self.config = config or ClientConfig(timeout=timeout)
+        self.http = HttpSession(headers=DEFAULT_HEADERS, config=self.config)
         self.csrf_token = credential.csrf_token if credential else ""
         if credential:
             self._apply_credential(credential)
@@ -51,26 +57,24 @@ class NeteaseMusicClient:
     def _apply_credential(self, credential: NeteaseCredential) -> None:
         self.csrf_token = credential.csrf_token
         for key, value in credential.cookies.items():
-            self.session.cookies.set(key, value, domain=".163.com")
+            self.http.session.cookies.set(key, value, domain=".163.com")
 
     def _bootstrap(self) -> None:
-        self.session.get(BASE_URL, timeout=self.timeout)
-        token = self.session.cookies.get("__csrf", domain=".163.com")
+        self.http.get(BASE_URL)
+        token = self.http.session.cookies.get("__csrf", domain=".163.com")
         if token:
             self.csrf_token = token
 
     def _post_weapi(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
         payload = data.copy()
         payload.setdefault("csrf_token", self.csrf_token)
-        response = self.session.post(
+        response = self.http.post(
             f"https://music.163.com{path}",
             params={"csrf_token": self.csrf_token},
             data=encrypt_weapi(payload),
-            timeout=self.timeout,
         )
-        response.raise_for_status()
         result = response.json()
-        token = self.session.cookies.get("__csrf", domain=".163.com")
+        token = self.http.session.cookies.get("__csrf", domain=".163.com")
         if token:
             self.csrf_token = token
         return result
@@ -98,22 +102,56 @@ class NeteaseMusicClient:
             songs.append(self._parse_song(item))
         return songs[:limit]
 
+    @staticmethod
+    def _guess_from_fee(fee: int, *, has_login: bool) -> bool | None:
+        if fee in FREE_FEE_VALUES:
+            return True
+        if fee == 1 and not has_login:
+            return False
+        return None
+
     def probe_downloadable(self, songs: list[Song], quality: str = "mp3_128") -> list[Song]:
+        has_login = self.credential is not None
         probed: list[Song] = []
+        need_api: list[Song] = []
+
         for song in songs:
-            downloadable = self.is_downloadable(song.mid, quality=quality)
-            probed.append(
-                Song(
-                    id=song.id,
-                    mid=song.mid,
-                    name=song.name,
-                    singer=song.singer,
-                    downloadable=downloadable,
-                    platform="netease",
-                    meta=dict(song.meta),
-                )
-            )
+            fee = int(song.meta.get("fee", -1))
+            guess = self._guess_from_fee(fee, has_login=has_login)
+            if guess is not None:
+                probed.append(self.copy_song(song, guess))
+            else:
+                need_api.append(song)
+
+        if need_api:
+            batch = self._batch_probe([s.mid for s in need_api], quality)
+            for song in need_api:
+                downloadable = batch.get(song.mid)
+                if downloadable is None:
+                    downloadable = self.is_downloadable(song.mid, quality=quality)
+                probed.append(self.copy_song(song, downloadable))
+
         return probed
+
+    def _batch_probe(self, song_ids: list[str], quality: str) -> dict[str, bool]:
+        if not song_ids:
+            return {}
+        profile = QUALITY_PROFILES.get(quality, QUALITY_PROFILES["mp3_128"])
+        result = self._post_weapi(
+            "/weapi/song/enhance/player/url/v1",
+            {
+                "ids": json.dumps([int(sid) for sid in song_ids]),
+                "level": profile["level"],
+                "encodeType": profile["encodeType"],
+            },
+        )
+        mapping: dict[str, bool] = {}
+        if result.get("code") != 200:
+            return mapping
+        for item in result.get("data") or []:
+            sid = str(item.get("id", ""))
+            mapping[sid] = bool(item.get("url"))
+        return mapping
 
     def is_downloadable(self, song_id: str, quality: str = "mp3_128") -> bool:
         try:
@@ -135,34 +173,31 @@ class NeteaseMusicClient:
             meta={
                 "album": (item.get("al") or {}).get("name", ""),
                 "duration": int(item.get("dt", 0) or 0),
+                "fee": int(item.get("fee", -1)),
             },
         )
 
     def _request_play_url(self, song_id: str, quality: str) -> tuple[str | None, str]:
-        profile = QUALITY_PROFILES.get(quality, QUALITY_PROFILES["mp3_128"])
-        result = self._post_weapi(
-            "/weapi/song/enhance/player/url/v1",
-            {
-                "ids": f"[{song_id}]",
-                "level": profile["level"],
-                "encodeType": profile["encodeType"],
-            },
-        )
-        if result.get("code") != 200:
-            return None, self._default_ext(quality)
-
-        data = result.get("data") or []
-        if not data:
-            return None, self._default_ext(quality)
-        item = data[0]
-        url = item.get("url")
-        if not url:
-            return None, self._default_ext(quality)
-        ext = str(item.get("type") or self._default_ext(quality))
-        return url, ext
+        batch = self._batch_probe([song_id], quality)
+        if batch.get(song_id):
+            profile = QUALITY_PROFILES.get(quality, QUALITY_PROFILES["mp3_128"])
+            result = self._post_weapi(
+                "/weapi/song/enhance/player/url/v1",
+                {
+                    "ids": f"[{song_id}]",
+                    "level": profile["level"],
+                    "encodeType": profile["encodeType"],
+                },
+            )
+            if result.get("code") == 200:
+                data = result.get("data") or []
+                if data and data[0].get("url"):
+                    item = data[0]
+                    return item["url"], str(item.get("type") or self._default_ext(quality))
+        return None, self._default_ext(quality)
 
     def resolve_download_url(self, song_id: str, quality: str = "mp3_128") -> tuple[str, str]:
-        qualities = [quality] + [q for q in QUALITY_FALLBACK if q != quality]
+        qualities = self.quality_chain(quality, QUALITY_FALLBACK)
         for q in qualities:
             url, ext = self._request_play_url(song_id, q)
             if url:
@@ -172,12 +207,7 @@ class NeteaseMusicClient:
     def get_lyric(self, song_id: str) -> str | None:
         result = self._post_weapi(
             "/weapi/song/lyric",
-            {
-                "id": song_id,
-                "lv": -1,
-                "kv": -1,
-                "tv": -1,
-            },
+            {"id": song_id, "lv": -1, "kv": -1, "tv": -1},
         )
         if result.get("code") != 200:
             return None
@@ -201,6 +231,9 @@ class NeteaseMusicClient:
             file.write(lyric)
         return lyric_path
 
+    def _resolve_song_url(self, song: Song, quality: str) -> tuple[str, str]:
+        return self.resolve_download_url(song.mid, quality)
+
     def download(
         self,
         song: Song,
@@ -210,36 +243,16 @@ class NeteaseMusicClient:
         *,
         with_lyric: bool = True,
     ) -> tuple[str, str | None]:
-        import os
-
-        url, ext = self.resolve_download_url(song.mid, quality)
-        safe_name = filename or self._safe_filename(f"{song.name} - {song.singer}")
-        os.makedirs(output_dir, exist_ok=True)
-        filepath = os.path.join(output_dir, f"{safe_name}.{ext}")
-
-        response = self.session.get(url, timeout=self.timeout, stream=True)
-        response.raise_for_status()
-        with open(filepath, "wb") as file:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    file.write(chunk)
-
-        if os.path.getsize(filepath) < 1024:
-            os.remove(filepath)
-            raise DownloadError("下载文件过小，可能下载失败")
-
-        lyric_path = self.save_lyric(song, output_dir, safe_name) if with_lyric else None
-        return filepath, lyric_path
+        return self.download_song_file(
+            song,
+            output_dir,
+            quality,
+            resolve_url=self._resolve_song_url,
+            save_lyric=self.save_lyric,
+            filename=filename,
+            with_lyric=with_lyric,
+        )
 
     @staticmethod
     def _default_ext(quality: str) -> str:
-        if quality == "flac":
-            return "flac"
-        if quality == "m4a":
-            return "m4a"
-        return "mp3"
-
-    @staticmethod
-    def _safe_filename(name: str) -> str:
-        name = re.sub(r'[\\/:*?"<>|]', "_", name)
-        return name.strip() or "unknown"
+        return BaseMusicClient.default_ext(quality)
